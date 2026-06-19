@@ -1,0 +1,17 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+
+# outputs / scratch
+*.png
+*.json
+*.log
+scratch/
