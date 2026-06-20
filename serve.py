@@ -133,8 +133,11 @@ class PagedEngine:
             while len(active) < max_batch and waiting:
                 s = waiting.popleft()
                 self.prefill(s)
-                (results.__setitem__(s.idx, s.out) or self._free(s)) if (
-                    s.last == self.eos or len(s.out) >= s.max_tokens) else active.append(s)
+                if s.last == self.eos or len(s.out) >= s.max_tokens:
+                    results[s.idx] = s.out      # finished during prefill
+                    self._free(s)
+                else:
+                    active.append(s)
             if not active:
                 continue
             self.decode(active)

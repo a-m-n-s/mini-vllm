@@ -1,76 +1,75 @@
 # mini-vllm
 
-A from-scratch **LLM serving engine** — built to learn how vLLM / SGLang actually
-work: continuous batching, paged KV cache, a custom attention kernel, and the
-scheduler that ties them together. Runs real GPT-2 on an RTX 4080.
+A small LLM serving engine I built to understand how vLLM/SGLang work under the
+hood: continuous batching, a paged KV cache, a custom attention kernel, and the
+scheduler that holds it together. Runs GPT-2 on an RTX 4080.
 
-Not a fast production engine; a *legible* one. Every piece is built up in stages,
-each one runnable and benchmarked, and validated against HuggingFace token-for-token.
+It's not meant to be fast. It's meant to be readable. Each part is built up in
+its own stage, and the model path is checked against HuggingFace token for token.
 
-Built after a toy KV-cache engine, reading/running nanoGPT, and a
+Came out of some earlier practice: a toy KV-cache engine, reading nanoGPT, and a
 [Triton softmax kernel](https://github.com/a-m-n-s/triton-softmax).
 
-## What's here
+## Files
 
-| File | What |
+| file | what |
 |------|------|
-| `workload.py` | synthetic request streams (controllable length + arrival distributions) |
-| `sequential.py` | Stage 1 — one request at a time (throughput floor) |
-| `static_batch.py` | Stage 2 — fixed batch; measures the idle-slot waste |
-| `continuous.py` | Stage 3 — continuous/in-flight batching (evict + admit mid-flight) |
-| `paged_kv.py` | block pool + block table + allocator (paged KV memory) |
-| `paged_attention.py` | **Triton paged-attention decode kernel** + correctness test + benchmark |
-| `gpt2.py` | our own GPT-2 forward (loads HF weights, matches HF exactly) |
-| `paged_gpt2.py` | GPT-2 routed through paged KV + the kernel |
-| `serve.py` | the full engine: continuous batching + paged KV + kernel + EOS |
-| `bench.py` / `plots.py` / `profile_serve.py` | benchmarks, figures, profiling |
+| `workload.py` | synthetic request streams (length + arrival distributions) |
+| `sequential.py` | one request at a time (the baseline) |
+| `static_batch.py` | fixed batches; measures the wasted slots |
+| `continuous.py` | continuous batching (evict + admit mid-flight) |
+| `paged_kv.py` | block pool + block table + allocator |
+| `paged_attention.py` | Triton paged-attention kernel + tests/benchmark |
+| `gpt2.py` | our own GPT-2 forward (loads HF weights) |
+| `paged_gpt2.py` | GPT-2 wired to the paged cache + kernel |
+| `serve.py` | the whole thing: batching + paged KV + kernel + EOS |
+| `bench.py` `plots.py` `profile_serve.py` | benchmarks, figures, profiling |
 
-## The ideas, in order
+## Notes on the ideas
 
-**Batching is ~free until the compute knee.** Decode is memory-bound (every step
-reloads the weights to make one token), so stacking sequences into a batch reuses
-that one weight-load. Continuous batching keeps the batch full by evicting finished
-sequences and admitting waiting ones mid-flight, instead of waiting for the slowest.
+Decode is memory-bound: every step reloads the weights to produce one token, so
+batching sequences together is nearly free until you hit the compute knee.
+Continuous batching keeps the batch full by swapping finished sequences out and
+waiting ones in, instead of stalling on the slowest.
 
 ![batching](fig_batching.png)
 
-**Paged KV + a custom kernel removes the padding waste.** KV is stored in fixed
-blocks (no per-sequence over-allocation, no fragmentation); a Triton kernel reads
-those scattered blocks directly via a block table — no gather, no padding. The
-advantage grows with length variance (real chat traffic).
+KV gets stored in fixed blocks instead of one padded tensor per sequence, so
+there's no per-sequence over-allocation and no fragmentation. The Triton kernel
+reads those scattered blocks directly through a block table, so no gather and no
+padding. The gap over a plain gather-and-attend grows with length variance.
 
 ![kernel](fig_kernel.png)
 
-**Own the model forward to route attention through your kernel.** GPT-2's weights
-are open; we load them into our own forward so attention runs through the paged
-kernel — exactly how vLLM integrates a model. Validated to match HF greedy output
-token-for-token. Per-stream we match HF; at 8 concurrent streams continuous
-batching + paging pull ahead of HF's own batched `generate`.
+To run attention through your own kernel you have to own the forward pass, so we
+load GPT-2's weights into our own code (this is also what vLLM does). Output
+matches HF greedy decode exactly. Per stream we're about even with HF; at 8
+concurrent streams the batching + paging pull ahead of HF's batched `generate`.
 
 ![hf vs ours](fig_hf_paged.png)
 
-## Profiling finding
+## Profiling
 
-`profile_serve.py` shows decode is **91% of wall time**, and within it the **matmuls
-dominate** (~79% of GPU time — the paged kernel is only ~4%). The loop is actually
-**CPU-bound** (CPU time ≫ CUDA time): the GPU sits idle waiting on Python launch
-overhead. That's the textbook case for CUDA graphs / fused kernels.
+`profile_serve.py` shows decode is ~90% of wall time, and inside it the matmuls
+dominate (the paged kernel is only a few percent). The loop is actually CPU-bound
+— the GPU spends a lot of time waiting on Python. That's the usual reason real
+engines reach for CUDA graphs and fused kernels.
 
-## Run
+## Running it
 
 ```bash
 pip install torch triton transformers matplotlib
 python bench.py            # sequential vs static vs continuous
 python paged_attention.py  # kernel correctness + benchmark
-python serve.py            # serve real prompts end to end
-python plots.py            # regenerate the figures
-python profile_serve.py    # profile the serving loop
+python serve.py            # serve some prompts
+python plots.py            # figures
+python profile_serve.py    # profile
 ```
 
-(Needs a CUDA GPU. Developed in WSL2 on an RTX 4080.)
+Needs a CUDA GPU. I run it in WSL2 on a 4080.
 
-## Caveats (it's a learning engine)
+## Caveats
 
-fp32, single GPU, greedy decode, prefill uses plain attention (only decode is
-paged). The point was to understand and build the serving machinery, not to beat
-production engines — though the pieces are the real ones.
+fp32, single GPU, greedy decode, and only the decode path is paged (prefill uses
+plain attention). The goal was to build and understand the machinery, not to beat
+a real engine — but the pieces are the same ones.
