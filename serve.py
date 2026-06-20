@@ -32,7 +32,7 @@ class Seq:
 
 
 class PagedEngine:
-    def __init__(self, model: GPT2, num_blocks=4096, block_size=16, eos_id=50256):
+    def __init__(self, model: GPT2, num_blocks=1024, block_size=16, eos_id=50256):
         self.m = model
         self.bs = block_size
         self.eos = eos_id
