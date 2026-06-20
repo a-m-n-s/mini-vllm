@@ -112,17 +112,41 @@ def reference(q, k_cache, v_cache, block_tables, seq_lens, scale=None):
     return out
 
 
-def _build_scenario(num_seqs, num_heads, D, block_size, num_blocks, seed=0):
-    """Allocate num_seqs sequences of random length in a BlockManager, fill the
-    pool with random K/V, and return everything the kernel needs."""
+def reference_batched(q, k_cache, v_cache, block_tables, seq_lens, scale=None):
+    """The FAIR baseline: paged decode WITHOUT a custom kernel. Gather every
+    sequence's blocks into one padded (S, H, maxlen, D) tensor and run batched
+    masked attention. Fully vectorized - no python loop. The cost the kernel
+    avoids is exactly this: materializing the gather + computing over padding."""
+    S, H, D = q.shape
+    bs = k_cache.shape[2]
+    L = block_tables.shape[1] * bs
+    scale = scale if scale is not None else 1.0 / math.sqrt(D)
+
+    bt = block_tables.long()
+    K = k_cache[bt].permute(0, 2, 1, 3, 4).reshape(S, H, L, D).float()   # (S,H,L,D)
+    V = v_cache[bt].permute(0, 2, 1, 3, 4).reshape(S, H, L, D).float()
+    mask = torch.arange(L, device=q.device)[None, :] < seq_lens[:, None]  # (S,L)
+
+    scores = torch.einsum("shd,shld->shl", q.float() * scale, K)
+    scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
+    p = scores.softmax(-1)
+    return torch.einsum("shl,shld->shd", p, V)
+
+
+def _build_scenario(num_seqs, num_heads, D, block_size, num_blocks, lengths=None, seed=0):
+    """Fill a BlockManager pool with random K/V and allocate num_seqs sequences.
+    Pass `lengths` to control the length distribution (else random 1..256)."""
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     bm = BlockManager(num_blocks, block_size, num_heads, D)
     bm.k_cache.normal_(generator=g)
     bm.v_cache.normal_(generator=g)
 
-    lens = torch.randint(1, 256, (num_seqs,), generator=g, device=DEVICE)
+    if lengths is None:
+        lengths = torch.randint(1, 256, (num_seqs,), generator=g, device=DEVICE)
+    else:
+        lengths = torch.tensor(lengths, device=DEVICE)
     for s in range(num_seqs):
-        bm.allocate(s, int(lens[s]))
+        bm.allocate(s, int(lengths[s]))
 
     max_nb = max(len(bm.block_table[s]) for s in range(num_seqs))
     bt = torch.zeros((num_seqs, max_nb), dtype=torch.int32, device=DEVICE)
@@ -131,27 +155,37 @@ def _build_scenario(num_seqs, num_heads, D, block_size, num_blocks, seed=0):
         bt[s, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=DEVICE)
 
     q = torch.randn((num_seqs, num_heads, D), generator=g, device=DEVICE, dtype=DTYPE)
-    return q, bm.k_cache, bm.v_cache, bt, lens.to(torch.int32)
+    return q, bm.k_cache, bm.v_cache, bt, lengths.to(torch.int32)
 
 
 def _test():
-    q, k, v, bt, sl = _build_scenario(num_seqs=16, num_heads=12, D=64,
-                                      block_size=16, num_blocks=1024)
+    q, k, v, bt, sl = _build_scenario(16, 12, 64, block_size=16, num_blocks=1024)
     out = paged_attention(q, k, v, bt, sl)
-    ref = reference(q, k, v, bt, sl)
-    diff = (out - ref).abs().max().item()
+    ref = reference(q, k, v, bt, sl)                 # ground truth (loop)
+    bat = reference_batched(q, k, v, bt, sl)         # fair baseline
     print("=== correctness ===")
-    print(f"  max abs diff vs reference: {diff:.2e}  ->  {'PASS' if diff < 1e-2 else 'FAIL'}")
+    print(f"  kernel  vs reference: {(out - ref).abs().max():.2e}  -> "
+          f"{'PASS' if (out - ref).abs().max() < 1e-2 else 'FAIL'}")
+    print(f"  batched vs reference: {(bat - ref).abs().max():.2e}  -> "
+          f"{'PASS' if (bat - ref).abs().max() < 1e-2 else 'FAIL'}")
 
 
 def _bench():
-    q, k, v, bt, sl = _build_scenario(num_seqs=64, num_heads=12, D=64,
-                                      block_size=16, num_blocks=4096)
-    t_kernel = triton.testing.do_bench(lambda: paged_attention(q, k, v, bt, sl))
-    t_ref = triton.testing.do_bench(lambda: reference(q, k, v, bt, sl))
-    print("\n=== benchmark (64 seqs, 12 heads, decode step) ===")
-    print(f"  triton paged kernel: {t_kernel:.3f} ms")
-    print(f"  gather + pytorch:    {t_ref:.3f} ms   ({t_ref / t_kernel:.1f}x slower)")
+    print("\n=== benchmark: kernel vs vectorized gather+attention (64 seqs, 12 heads) ===")
+    print(f"  {'length mix':<22}{'kernel':>10}{'gather':>10}{'speedup':>9}{'pad waste':>11}")
+    scenarios = {
+        "uniform ~256": [256] * 64,
+        "uniform ~64": [64] * 64,
+        "high variance (8..1000)": [1000 if i % 8 == 0 else 16 for i in range(64)],
+    }
+    for name, lengths in scenarios.items():
+        q, k, v, bt, sl = _build_scenario(64, 12, 64, 16, num_blocks=8192, lengths=lengths)
+        tk = triton.testing.do_bench(lambda: paged_attention(q, k, v, bt, sl))
+        tg = triton.testing.do_bench(lambda: reference_batched(q, k, v, bt, sl))
+        # padded slots / real tokens => how much compute the gather baseline wastes
+        padded = bt.shape[1] * 16 * 64
+        waste = padded / int(sl.sum())
+        print(f"  {name:<22}{tk:>8.3f}ms{tg:>8.3f}ms{tg/tk:>8.1f}x{waste:>9.1f}x")
 
 
 if __name__ == "__main__":
