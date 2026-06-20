@@ -95,6 +95,21 @@ def _toks_per_s_hf(hf, ids, eos, n=100):
     return n / (time.perf_counter() - t0)
 
 
+def _toks_per_s_hf_batched(hf, tok, texts, n=100):
+    # HF's own batched generate: left-pad the prompts + attention mask. This is
+    # the fair 8-stream counterpart to our continuous-batching engine.
+    tok.padding_side = "left"
+    tok.pad_token = tok.eos_token
+    enc = tok(texts, return_tensors="pt", padding=True).to(DEVICE)
+    gen = dict(max_new_tokens=n, do_sample=False, pad_token_id=tok.eos_token_id)
+    hf.generate(**enc, **{**gen, "max_new_tokens": 5})   # warmup
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    out = hf.generate(**enc, **gen)
+    torch.cuda.synchronize()
+    new = (out.shape[1] - enc["input_ids"].shape[1]) * len(texts)
+    return new / (time.perf_counter() - t0)
+
+
 def fig_hf_paged():
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
     texts = ["The capital of France is", "Once upon a time,",
@@ -110,15 +125,16 @@ def fig_hf_paged():
     vals = [
         _toks_per_s_hf(hf, ids0, tok.eos_token_id),
         _toks_per_s_ours_single(gm, ids0),
+        _toks_per_s_hf_batched(hf, tok, texts),
         _toks_per_s_ours_batched(gm, plist),
     ]
-    labels = ["HF gpt2\n(1 stream)", "ours paged\n(1 stream)", "ours paged\n(8 streams)"]
-    plt.figure(figsize=(6, 4))
-    bars = plt.bar(labels, vals, color=[GREY, BLUE, GREEN])
+    labels = ["HF\n1 stream", "ours paged\n1 stream", "HF\n8 streams", "ours paged\n8 streams"]
+    plt.figure(figsize=(7, 4))
+    bars = plt.bar(labels, vals, color=[GREY, BLUE, GREY, GREEN])
     for b, v in zip(bars, vals):
         plt.text(b.get_x() + b.get_width() / 2, v, f"{v:.0f}", ha="center", va="bottom")
     plt.ylabel("throughput (tok/s)")
-    plt.title("HF gpt2 vs our paged engine (greedy decode)")
+    plt.title("HF gpt2 vs our paged engine (greedy decode, fp32)")
     plt.tight_layout(); plt.savefig("fig_hf_paged.png", dpi=130); plt.close()
     print("saved fig_hf_paged.png")
 
